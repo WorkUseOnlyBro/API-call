@@ -84,3 +84,143 @@ elif isinstance(data, dict):
 # If it's something else, just print it nicely
 else:
     print(json.dumps(data, indent=2))
+----------------------------------------------------------------------------
+"""
+API POST Request with Tkinter Tree View for JSON Response
+"""
+
+import requests
+import json
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+
+# === YOUR CONFIGURATION ===
+url = "https://your-api-endpoint.com/api"
+password = "your_password_here"
+arc_id = "your_arc_id_here"
+hash_value = "your_hash_value_here"
+
+def insert_json(tree, parent, key, value):
+    """
+    Recursively insert JSON data into the tree view
+    """
+    if isinstance(value, dict):
+        # It's a dictionary - create a parent node
+        node = tree.insert(parent, 'end', text=key, values=("{ }", ""))
+        for k, v in value.items():
+            insert_json(tree, node, k, v)
+    elif isinstance(value, list):
+        # It's a list - create a parent node
+        node = tree.insert(parent, 'end', text=key, values=(f"[ ] ({len(value)} items)", ""))
+        for i, item in enumerate(value):
+            insert_json(tree, node, f"[{i}]", item)
+    else:
+        # It's a simple value - create a leaf node
+        tree.insert(parent, 'end', text=key, values=(value, type(value).__name__))
+
+def make_api_call():
+    """
+    Make the API call and display results
+    """
+    status_label.config(text="Sending request...", fg="blue")
+    root.update()
+    
+    try:
+        # Headers
+        headers = {
+            'Auth-Password': password,
+            'Arc-id': arc_id,
+            'Hash': hash_value
+        }
+        
+        # Make the request
+        response = requests.post(url, headers=headers)
+        
+        # Update status
+        status_label.config(
+            text=f"Status Code: {response.status_code}", 
+            fg="green" if response.status_code == 200 else "red"
+        )
+        
+        # Parse JSON
+        data = response.json()
+        
+        # Clear existing tree
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        # Insert new data
+        insert_json(tree, '', 'Response', data)
+        
+        # Show raw JSON in text area
+        raw_text.delete(1.0, tk.END)
+        raw_text.insert(1.0, json.dumps(data, indent=2))
+        
+    except Exception as e:
+        status_label.config(text=f"Error: {str(e)}", fg="red")
+        raw_text.delete(1.0, tk.END)
+        raw_text.insert(1.0, f"Error: {str(e)}")
+
+# === CREATE GUI ===
+root = tk.Tk()
+root.title("API JSON Viewer")
+root.geometry("900x600")
+
+# Top frame for button and status
+top_frame = tk.Frame(root)
+top_frame.pack(pady=10, padx=10, fill=tk.X)
+
+# Button to make API call
+call_button = tk.Button(top_frame, text="Make API Call", command=make_api_call, 
+                        bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), 
+                        padx=20, pady=5)
+call_button.pack(side=tk.LEFT)
+
+# Status label
+status_label = tk.Label(top_frame, text="Ready", font=("Arial", 10))
+status_label.pack(side=tk.LEFT, padx=20)
+
+# Notebook for tabs
+notebook = ttk.Notebook(root)
+notebook.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+# === TAB 1: Tree View ===
+tree_frame = tk.Frame(notebook)
+notebook.add(tree_frame, text="Tree View")
+
+# Scrollbars for tree
+tree_scroll_y = tk.Scrollbar(tree_frame)
+tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+tree_scroll_x = tk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+# Tree view
+tree = ttk.Treeview(tree_frame, 
+                    columns=("Value", "Type"),
+                    yscrollcommand=tree_scroll_y.set,
+                    xscrollcommand=tree_scroll_x.set)
+
+tree.heading("#0", text="Key")
+tree.heading("Value", text="Value")
+tree.heading("Type", text="Type")
+
+tree.column("#0", width=300)
+tree.column("Value", width=400)
+tree.column("Type", width=100)
+
+tree.pack(fill=tk.BOTH, expand=True)
+
+tree_scroll_y.config(command=tree.yview)
+tree_scroll_x.config(command=tree.xview)
+
+# === TAB 2: Raw JSON ===
+raw_frame = tk.Frame(notebook)
+notebook.add(raw_frame, text="Raw JSON")
+
+raw_text = scrolledtext.ScrolledText(raw_frame, wrap=tk.WORD, font=("Courier", 10))
+raw_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+# Start the GUI
+print("GUI Started - Click 'Make API Call' button to fetch data")
+root.mainloop()
