@@ -1,0 +1,27 @@
+"""
+Simple API POST Request with Custom Headers
+"""
+
+import requests
+
+# === YOUR CONFIGURATION ===
+url = "https://your-api-endpoint.com/api"
+password = "your_password_here"
+arc_id = "your_arc_id_here"
+hash_value = "your_hash_value_here"
+
+# === HEADERS ===
+headers = {
+    'Auth-Password': password,
+    'Arc-id': arc_id,
+    'Hash': hash_value
+}
+
+# === MAKE THE REQUEST ===
+print("Sending POST request...")
+
+response = requests.post(url, headers=headers)
+
+# === SHOW RESULTS ===
+print(f"Status Code: {response.status_code}")
+print(f"Response: {response.text}")
