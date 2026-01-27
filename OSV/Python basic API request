@@ -25,3 +25,62 @@ response = requests.post(url, headers=headers)
 # === SHOW RESULTS ===
 print(f"Status Code: {response.status_code}")
 print(f"Response: {response.text}")
+-------------------------------------------------------------
+"""
+API call with json parsing
+"""
+"""
+Simple API POST Request with Custom Headers
+Displays JSON response as a table
+"""
+
+import requests
+import json
+from tabulate import tabulate
+
+# === YOUR CONFIGURATION ===
+url = "https://your-api-endpoint.com/api"
+password = "your_password_here"
+arc_id = "your_arc_id_here"
+hash_value = "your_hash_value_here"
+
+# === HEADERS ===
+headers = {
+    'Auth-Password': password,
+    'Arc-id': arc_id,
+    'Hash': hash_value
+}
+
+# === MAKE THE REQUEST ===
+print("Sending POST request...")
+
+response = requests.post(url, headers=headers)
+
+# === SHOW RESULTS ===
+print(f"Status Code: {response.status_code}\n")
+
+# Parse JSON response
+data = response.json()
+
+# Display as table
+# If response is a list of objects (most common)
+if isinstance(data, list):
+    if len(data) > 0:
+        # Get column headers from the first item
+        headers_list = list(data[0].keys())
+        # Create rows
+        rows = [list(item.values()) for item in data]
+        # Print table
+        print(tabulate(rows, headers=headers_list, tablefmt='grid'))
+    else:
+        print("Empty list returned")
+
+# If response is a single object
+elif isinstance(data, dict):
+    # Display key-value pairs as a table
+    rows = [[key, value] for key, value in data.items()]
+    print(tabulate(rows, headers=['Key', 'Value'], tablefmt='grid'))
+
+# If it's something else, just print it nicely
+else:
+    print(json.dumps(data, indent=2))
