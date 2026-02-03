@@ -1,0 +1,262 @@
+"""
+Paginated API to SQL Database Script
+Fetches JSON data page by page and writes each page to SQL Server
+"""
+
+import requests
+import pyodbc
+import json
+from datetime import datetime, timedelta
+
+# === API CONFIGURATION ===
+api_url = "https://your-api-endpoint.com/api"
+password = "your_password_here"
+arc_id = "your_arc_id_here"
+hash_value = "your_hash_value_here"
+
+# === DATE RANGE CONFIGURATION ===
+# Set to True to automatically pull previous day's data
+use_previous_day = True
+
+# Or manually set dates (ignored if use_previous_day is True)
+manual_start_date = "2026-01-28"  # Format: YYYY-MM-DD
+manual_end_date = "2026-01-29"    # Format: YYYY-MM-DD
+
+# === PAGINATION SETTINGS ===
+page_size = 100  # Number of records per page (adjust based on your API)
+start_page = 1   # Starting page number
+max_records = 1000  # Maximum records to pull (set to None for unlimited)
+
+# === SQL SERVER CONFIGURATION ===
+sql_server = "your_server_name"
+sql_database = "your_database_name"
+sql_table = "your_table_name"
+
+# Choose authentication method
+# Option 1: Windows Authentication
+sql_connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={sql_server};DATABASE={sql_database};Trusted_Connection=yes;"
+
+# Option 2: SQL Authentication (uncomment if using SQL login)
+# sql_username = "your_sql_username"
+# sql_password = "your_sql_password"
+# sql_connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={sql_server};DATABASE={sql_database};UID={sql_username};PWD={sql_password};"
+
+# === COLUMN MAPPING ===
+# Map API field names to SQL column names
+# Format: 'api_field_name': 'sql_column_name'
+column_mapping = {
+    'id': 'RecordID',
+    'firstName': 'FirstName',
+    'lastName': 'LastName',
+    'email': 'EmailAddress',
+    'createdDate': 'DateCreated',
+    # Add more mappings as needed
+}
+
+# If you want to use the API field names as-is, leave this empty or set to None
+# column_mapping = None
+
+
+def get_date_range():
+    """
+    Get the start and end dates for the API query
+    Returns: (start_date, end_date) in YYYY-MM-DD format
+    """
+    if use_previous_day:
+        # Get yesterday's date
+        yesterday = datetime.now() - timedelta(days=1)
+        start_date = yesterday.strftime('%Y-%m-%d')
+        end_date = yesterday.strftime('%Y-%m-%d')
+    else:
+        # Use manual dates
+        start_date = manual_start_date
+        end_date = manual_end_date
+    
+    return start_date, end_date
+
+
+def fetch_page(page_number):
+    """
+    Fetch a single page of data from the API
+    
+    Returns: (data_entries, has_more_pages)
+    """
+    print(f"Fetching page {page_number}...")
+    
+    # Get date range
+    start_date, end_date = get_date_range()
+    
+    headers = {
+        'Auth-Password': password,
+        'Arc-id': arc_id,
+        'Hash': hash_value
+    }
+    
+    # Build URL with query parameters including dates and pagination
+    url_with_params = f"{api_url}?startDate={start_date}&endDate={end_date}&limit={page_size}&page={page_number}"
+    
+    try:
+        response = requests.post(url_with_params, headers=headers)
+        response.raise_for_status()
+        
+        json_data = response.json()
+        
+        if json_data.get('success'):
+            data_entries = json_data.get('data', [])
+            print(f"  Retrieved {len(data_entries)} entries from page {page_number}")
+            
+            # Determine if there are more pages
+            # This logic may need adjustment based on your API's response structure
+            has_more = len(data_entries) == page_size
+            
+            return data_entries, has_more
+        else:
+            print(f"  API returned success: false for page {page_number}")
+            return [], False
+            
+    except Exception as e:
+        print(f"  Error fetching page {page_number}: {e}")
+        return [], False
+
+
+def insert_page_to_database(conn, cursor, data_entries, page_number):
+    """
+    Insert a page of data entries into SQL Server
+    """
+    if not data_entries:
+        return 0, 0
+    
+    # Get API field names from the first entry
+    api_fields = list(data_entries[0].keys())
+    
+    # Map to SQL column names
+    if column_mapping:
+        # Use mapped column names
+        sql_columns = [column_mapping.get(field, field) for field in api_fields]
+    else:
+        # Use API field names as-is
+        sql_columns = api_fields
+    
+    # Create INSERT statement
+    placeholders = ', '.join(['?' for _ in sql_columns])
+    column_names = ', '.join([f"[{col}]" for col in sql_columns])
+    insert_sql = f"INSERT INTO {sql_table} ({column_names}) VALUES ({placeholders})"
+    
+    success_count = 0
+    error_count = 0
+    
+    for i, entry in enumerate(data_entries, 1):
+        try:
+            # Extract values using the original API field names
+            values = [entry.get(field) for field in api_fields]
+            cursor.execute(insert_sql, values)
+            success_count += 1
+        except Exception as e:
+            error_count += 1
+            print(f"    Error on row {i} of page {page_number}: {e}")
+    
+    # Commit this page
+    conn.commit()
+    
+    return success_count, error_count
+
+
+def main():
+    """
+    Main execution - fetch pages and write to database
+    """
+    # Get the date range we're querying
+    start_date, end_date = get_date_range()
+    
+    print("=" * 60)
+    print("Paginated API to SQL Database Import")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Date Range: {start_date} to {end_date}")
+    if max_records:
+        print(f"Max Records Limit: {max_records}")
+    print("=" * 60)
+    
+    total_success = 0
+    total_errors = 0
+    page_number = start_page
+    limit_reached = False
+    
+    try:
+        # Connect to database once for all pages
+        print("\nConnecting to SQL Server...")
+        conn = pyodbc.connect(sql_connection_string)
+        cursor = conn.cursor()
+        print("Connected successfully\n")
+        
+        # Loop through pages
+        while True:
+            # Check if we've hit the max record limit
+            if max_records and total_success >= max_records:
+                print(f"\n*** MAX RECORD LIMIT REACHED ***")
+                print(f"*** Stopped at {total_success} records (limit: {max_records}) ***")
+                limit_reached = True
+                break
+            
+            # Fetch this page
+            data_entries, has_more = fetch_page(page_number)
+            
+            # If no data, we're done
+            if not data_entries:
+                print(f"\nNo more data after page {page_number - 1}")
+                break
+            
+            # Check if this page would exceed the limit
+            if max_records and (total_success + len(data_entries)) > max_records:
+                # Only take what we need to hit the limit
+                records_needed = max_records - total_success
+                print(f"  Limiting page {page_number} to {records_needed} records to stay within max limit")
+                data_entries = data_entries[:records_needed]
+            
+            # Write this page to database
+            print(f"  Writing page {page_number} to database...")
+            success, errors = insert_page_to_database(conn, cursor, data_entries, page_number)
+            
+            total_success += success
+            total_errors += errors
+            
+            print(f"  Page {page_number}: {success} inserted, {errors} errors (Total: {total_success})")
+            
+            # Check if we've now hit the limit
+            if max_records and total_success >= max_records:
+                print(f"\n*** MAX RECORD LIMIT REACHED ***")
+                print(f"*** Stopped at {total_success} records (limit: {max_records}) ***")
+                limit_reached = True
+                break
+            
+            # Check if there are more pages
+            if not has_more:
+                print(f"\nAll data retrieved (last page: {page_number})")
+                break
+            
+            page_number += 1
+        
+        # Close connection
+        cursor.close()
+        conn.close()
+        
+        # Summary
+        print("\n" + "=" * 60)
+        print("=== FINAL RESULTS ===")
+        print(f"Total pages processed: {page_number - start_page + 1}")
+        print(f"Total rows inserted: {total_success}")
+        print(f"Total errors: {total_errors}")
+        
+        if limit_reached:
+            print(f"\n!!! ALERT: MAX RECORD LIMIT WAS REACHED !!!")
+            print(f"!!! Only {total_success} of available records were pulled !!!")
+            print(f"!!! More data may be available from the API !!!")
+        
+        print(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\nDatabase connection error: {e}")
+
+
+if __name__ == "__main__":
+    main()
