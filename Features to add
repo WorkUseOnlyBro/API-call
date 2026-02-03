@@ -1,0 +1,11 @@
+- Rolling stop and start dates based on current date.
+- Set max size, if number of data entries grabbed = max limit send error message.
+- Set password and hash to env varibles.
+✓ Fine tune pagination, don't just do one it will time out.
+- Get our own credential from Priavo.
+- Job and Error Logging. 
+✓ Write to DB.
+- Send email alert if anything fails.  
+- Write documentation block.
+- Requirements text file.
+- Status code error handling. 
