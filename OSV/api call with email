@@ -1,0 +1,377 @@
+"""
+Paginated API to SQL Database Script
+Fetches JSON data page by page and writes each page to SQL Server
+"""
+
+import requests
+import pyodbc
+import json
+from datetime import datetime, timedelta
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# === API CONFIGURATION ===
+api_url = "https://your-api-endpoint.com/api"
+password = "your_password_here"
+arc_id = "your_arc_id_here"
+hash_value = "your_hash_value_here"
+
+# === DATE RANGE CONFIGURATION ===
+# Set to True to automatically pull previous day's data
+use_previous_day = True
+
+# Or manually set dates (ignored if use_previous_day is True)
+manual_start_date = "2026-01-28"  # Format: YYYY-MM-DD
+manual_end_date = "2026-01-29"    # Format: YYYY-MM-DD
+
+# === EMAIL CONFIGURATION ===
+send_email_report = True  # Set to False to disable email reports
+
+# Email settings
+smtp_server = "smtp.gmail.com"  # e.g., "smtp.gmail.com" or "smtp.office365.com"
+smtp_port = 587  # Usually 587 for TLS
+smtp_username = "your_email@example.com"
+smtp_password = "your_email_password"  # Or app-specific password
+
+# Email details
+email_from = "your_email@example.com"
+email_to = ["recipient1@example.com", "recipient2@example.com", "recipient3@example.com"]
+email_subject = "API to SQL Database Import Report"
+
+# === PAGINATION SETTINGS ===
+page_size = 100  # Number of records per page (adjust based on your API)
+start_page = 1   # Starting page number
+max_records = 1000  # Maximum records to pull (set to None for unlimited)
+
+# === SQL SERVER CONFIGURATION ===
+sql_server = "your_server_name"
+sql_database = "your_database_name"
+sql_table = "your_table_name"
+
+# Choose authentication method
+# Option 1: Windows Authentication
+sql_connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={sql_server};DATABASE={sql_database};Trusted_Connection=yes;"
+
+# Option 2: SQL Authentication (uncomment if using SQL login)
+# sql_username = "your_sql_username"
+# sql_password = "your_sql_password"
+# sql_connection_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={sql_server};DATABASE={sql_database};UID={sql_username};PWD={sql_password};"
+
+# === COLUMN MAPPING ===
+# Map API field names to SQL column names
+# Format: 'api_field_name': 'sql_column_name'
+column_mapping = {
+    'id': 'RecordID',
+    'firstName': 'FirstName',
+    'lastName': 'LastName',
+    'email': 'EmailAddress',
+    'createdDate': 'DateCreated',
+    # Add more mappings as needed
+}
+
+# If you want to use the API field names as-is, leave this empty or set to None
+# column_mapping = None
+
+
+def get_date_range():
+    """
+    Get the start and end dates for the API query
+    Returns: (start_date, end_date) in YYYY-MM-DD format
+    """
+    if use_previous_day:
+        # Get yesterday's date
+        yesterday = datetime.now() - timedelta(days=1)
+        start_date = yesterday.strftime('%Y-%m-%d')
+        end_date = yesterday.strftime('%Y-%m-%d')
+    else:
+        # Use manual dates
+        start_date = manual_start_date
+        end_date = manual_end_date
+    
+    return start_date, end_date
+
+
+def send_email_report(start_time, end_time, records_pulled, errors, error_messages, limit_reached, start_date, end_date):
+    """
+    Send email report with job results
+    """
+    if not send_email_report:
+        return
+    
+    try:
+        # Calculate duration
+        duration = end_time - start_time
+        duration_str = str(duration).split('.')[0]  # Remove microseconds
+        
+        # Build email body
+        email_body = f"""
+API to SQL Database Import Report
+{'=' * 50}
+
+Job Details:
+- Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}
+- End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}
+- Duration: {duration_str}
+- Date Range: {start_date} to {end_date}
+
+Results:
+- Records Successfully Inserted: {records_pulled}
+- Errors: {errors}
+
+"""
+        
+        # Add limit warning if applicable
+        if limit_reached:
+            email_body += f"""
+⚠️ WARNING: MAX RECORD LIMIT REACHED ⚠️
+Only {records_pulled} records were pulled due to the configured limit.
+More data may be available from the API.
+
+"""
+        
+        # Add error messages if any
+        if error_messages:
+            email_body += "Error Messages:\n"
+            for i, error in enumerate(error_messages, 1):
+                email_body += f"{i}. {error}\n"
+        else:
+            email_body += "No errors encountered.\n"
+        
+        email_body += f"\n{'=' * 50}\n"
+        
+        # Create email message
+        msg = MIMEMultipart()
+        msg['From'] = email_from
+        msg['To'] = ', '.join(email_to)
+        msg['Subject'] = email_subject
+        
+        msg.attach(MIMEText(email_body, 'plain'))
+        
+        # Send email
+        print("\nSending email report...")
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.send_message(msg)
+        server.quit()
+        
+        print(f"Email report sent to: {', '.join(email_to)}")
+        
+    except Exception as e:
+        print(f"Failed to send email report: {e}")
+
+
+def fetch_page(page_number):
+    """
+    Fetch a single page of data from the API
+    
+    Returns: (data_entries, has_more_pages)
+    """
+    print(f"Fetching page {page_number}...")
+    
+    # Get date range
+    start_date, end_date = get_date_range()
+    
+    headers = {
+        'Auth-Password': password,
+        'Arc-id': arc_id,
+        'Hash': hash_value
+    }
+    
+    # Build URL with query parameters including dates and pagination
+    url_with_params = f"{api_url}?startDate={start_date}&endDate={end_date}&limit={page_size}&page={page_number}"
+    
+    try:
+        response = requests.post(url_with_params, headers=headers)
+        response.raise_for_status()
+        
+        json_data = response.json()
+        
+        if json_data.get('success'):
+            data_entries = json_data.get('data', [])
+            print(f"  Retrieved {len(data_entries)} entries from page {page_number}")
+            
+            # Determine if there are more pages
+            # This logic may need adjustment based on your API's response structure
+            has_more = len(data_entries) == page_size
+            
+            return data_entries, has_more
+        else:
+            print(f"  API returned success: false for page {page_number}")
+            return [], False
+            
+    except Exception as e:
+        print(f"  Error fetching page {page_number}: {e}")
+        return [], False
+
+
+def insert_page_to_database(conn, cursor, data_entries, page_number):
+    """
+    Insert a page of data entries into SQL Server
+    """
+    if not data_entries:
+        return 0, 0
+    
+    # Get API field names from the first entry
+    api_fields = list(data_entries[0].keys())
+    
+    # Map to SQL column names
+    if column_mapping:
+        # Use mapped column names
+        sql_columns = [column_mapping.get(field, field) for field in api_fields]
+    else:
+        # Use API field names as-is
+        sql_columns = api_fields
+    
+    # Create INSERT statement
+    placeholders = ', '.join(['?' for _ in sql_columns])
+    column_names = ', '.join([f"[{col}]" for col in sql_columns])
+    insert_sql = f"INSERT INTO {sql_table} ({column_names}) VALUES ({placeholders})"
+    
+    success_count = 0
+    error_count = 0
+    
+    for i, entry in enumerate(data_entries, 1):
+        try:
+            # Extract values using the original API field names
+            values = [entry.get(field) for field in api_fields]
+            cursor.execute(insert_sql, values)
+            success_count += 1
+        except Exception as e:
+            error_count += 1
+            print(f"    Error on row {i} of page {page_number}: {e}")
+    
+    # Commit this page
+    conn.commit()
+    
+    return success_count, error_count
+
+
+def main():
+    """
+    Main execution - fetch pages and write to database
+    """
+    # Get the date range we're querying
+    start_date, end_date = get_date_range()
+    
+    # Track start time
+    start_time = datetime.now()
+    
+    print("=" * 60)
+    print("Paginated API to SQL Database Import")
+    print(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Date Range: {start_date} to {end_date}")
+    if max_records:
+        print(f"Max Records Limit: {max_records}")
+    print("=" * 60)
+    
+    total_success = 0
+    total_errors = 0
+    page_number = start_page
+    limit_reached = False
+    error_messages = []
+    
+    try:
+        # Connect to database once for all pages
+        print("\nConnecting to SQL Server...")
+        conn = pyodbc.connect(sql_connection_string)
+        cursor = conn.cursor()
+        print("Connected successfully\n")
+        
+        # Loop through pages
+        while True:
+            # Check if we've hit the max record limit
+            if max_records and total_success >= max_records:
+                print(f"\n*** MAX RECORD LIMIT REACHED ***")
+                print(f"*** Stopped at {total_success} records (limit: {max_records}) ***")
+                limit_reached = True
+                break
+            
+            # Fetch this page
+            try:
+                data_entries, has_more = fetch_page(page_number)
+            except Exception as e:
+                error_msg = f"Error fetching page {page_number}: {e}"
+                print(f"  {error_msg}")
+                error_messages.append(error_msg)
+                break
+            
+            # If no data, we're done
+            if not data_entries:
+                print(f"\nNo more data after page {page_number - 1}")
+                break
+            
+            # Check if this page would exceed the limit
+            if max_records and (total_success + len(data_entries)) > max_records:
+                # Only take what we need to hit the limit
+                records_needed = max_records - total_success
+                print(f"  Limiting page {page_number} to {records_needed} records to stay within max limit")
+                data_entries = data_entries[:records_needed]
+            
+            # Write this page to database
+            print(f"  Writing page {page_number} to database...")
+            try:
+                success, errors = insert_page_to_database(conn, cursor, data_entries, page_number)
+                
+                total_success += success
+                total_errors += errors
+                
+                print(f"  Page {page_number}: {success} inserted, {errors} errors (Total: {total_success})")
+                
+                if errors > 0:
+                    error_messages.append(f"Page {page_number} had {errors} insert errors")
+                    
+            except Exception as e:
+                error_msg = f"Error writing page {page_number} to database: {e}"
+                print(f"  {error_msg}")
+                error_messages.append(error_msg)
+                break
+            
+            # Check if we've now hit the limit
+            if max_records and total_success >= max_records:
+                print(f"\n*** MAX RECORD LIMIT REACHED ***")
+                print(f"*** Stopped at {total_success} records (limit: {max_records}) ***")
+                limit_reached = True
+                break
+            
+            # Check if there are more pages
+            if not has_more:
+                print(f"\nAll data retrieved (last page: {page_number})")
+                break
+            
+            page_number += 1
+        
+        # Close connection
+        cursor.close()
+        conn.close()
+        
+    except Exception as e:
+        error_msg = f"Database connection error: {e}"
+        print(f"\n{error_msg}")
+        error_messages.append(error_msg)
+    
+    # Track end time
+    end_time = datetime.now()
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("=== FINAL RESULTS ===")
+    print(f"Total pages processed: {page_number - start_page + 1}")
+    print(f"Total rows inserted: {total_success}")
+    print(f"Total errors: {total_errors}")
+    
+    if limit_reached:
+        print(f"\n!!! ALERT: MAX RECORD LIMIT WAS REACHED !!!")
+        print(f"!!! Only {total_success} of available records were pulled !!!")
+        print(f"!!! More data may be available from the API !!!")
+    
+    print(f"\nCompleted: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+    
+    # Send email report
+    send_email_report(start_time, end_time, total_success, total_errors, error_messages, limit_reached, start_date, end_date)
+
+
+if __name__ == "__main__":
+    main()
