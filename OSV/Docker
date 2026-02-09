@@ -1,0 +1,43 @@
+# Start from official Python image
+FROM python:3.11-slim
+
+# Set working directory inside container
+WORKDIR /app
+
+# Copy requirements first (for better caching)
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of your application
+COPY . .
+
+# Expose port if your app is a web service (adjust as needed)
+EXPOSE 8000
+
+# Command to run your app
+CMD ["python", "app.py"]
+```
+
+**Key points:**
+- We copy `requirements.txt` separately before copying everything else - this uses Docker's layer caching so dependencies don't reinstall every time you change code
+- `--no-cache-dir` keeps the image smaller
+- Adjust the `CMD` to however you run your app
+
+## 3. Create a .dockerignore file
+
+This prevents unnecessary files from being copied into your image:
+```
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.git
+.gitignore
+.vscode
+*.md
