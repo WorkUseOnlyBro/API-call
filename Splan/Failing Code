@@ -1,0 +1,33 @@
+             public async Task<string> GetAuthenticationTokenAsync()
+        {
+            Log.Information($"Authenticating with SPLAN API.");
+            var body = JsonSerializer.Serialize(new { userid = _apiSettings.UserId, password = _apiSettings.Password });
+            var content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            var response = await _httpClient.PostAsync(_apiSettings.BaseUrl + _apiSettings.AuthEndpoint, content);
+            response.EnsureSuccessStatusCode();
+            if (response.IsSuccessStatusCode)
+            {
+                var jsonString = await response.Content.ReadAsStringAsync();
+                var authResponse = JsonSerializer.Deserialize<AuthResponse>(jsonString);
+                _accessToken = authResponse?.AccessToken;
+                Log.Information($"Authentication successful.");
+                return _accessToken;
+            }
+            else
+            {
+                Log.Information($"Authentication unsuccessful. Response status code was: {response.StatusCode}");
+                return null;
+            }
+        }
+
+-------------
+headers
+Content-Type:"application/json"
+Accept-Encoding: "gzip,deflate,br"
+body to pass in
+  --data '{
+	"userid":"user",
+	"password":"password"
+	
+}'
