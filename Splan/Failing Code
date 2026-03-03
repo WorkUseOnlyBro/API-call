@@ -248,5 +248,11 @@ client.DefaultRequestHeaders.Add("User-Agent", "insomnia/10.0.0"); // or just an
 Info($"URL:          {fullUrl}");
 Info($"Request body: {body}");
 
+-----------------------------
+using var client = new HttpClient(new HttpClientHandler
+{
+    ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true
+});
+
 var response = await client.PostAsync(fullUrl, content);
 var rawBody  = await response.Content.ReadAsStringAsync();
