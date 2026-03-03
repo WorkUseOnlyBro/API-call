@@ -233,3 +233,20 @@ class AuthDiagnostics
     static void Info(string msg) => Console.WriteLine($"  [INFO] {msg}");
 }
 
+----------------headers
+using var client = new HttpClient();
+
+var fullUrl = BASE_URL + AUTH_ENDPOINT;
+var body    = JsonSerializer.Serialize(new { userid = USER_ID, password = PASSWORD });
+var content = new StringContent(body, Encoding.UTF8, "application/json");
+
+// Explicitly match your working Insomnia headers
+client.DefaultRequestHeaders.Add("Accept-Encoding", "gzip, deflate, br");
+client.DefaultRequestHeaders.Add("Accept", "*/*");
+client.DefaultRequestHeaders.Add("User-Agent", "insomnia/10.0.0"); // or just any value
+
+Info($"URL:          {fullUrl}");
+Info($"Request body: {body}");
+
+var response = await client.PostAsync(fullUrl, content);
+var rawBody  = await response.Content.ReadAsStringAsync();
