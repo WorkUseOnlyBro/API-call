@@ -31,3 +31,205 @@ body to pass in
 	"password":"password"
 	
 }'
+-------------------------------------------
+testing 
+// =====================================================================
+// AuthDiagnostics.cs - Standalone Auth Token Diagnostic Tests
+//
+// HOW TO USE:
+//   1. Create a new Console App project in Visual Studio (.NET 6+)
+//   2. Replace Program.cs contents with this file
+//   3. Fill in your real values in the CONFIG block at the top
+//   4. Run it - each test prints PASS/FAIL with details
+// =====================================================================
+
+using System;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+
+class AuthDiagnostics
+{
+    // ---------------------------------------------------------------
+    // CONFIG - replace these with your real values
+    // ---------------------------------------------------------------
+    const string BASE_URL      = "https://your-api-url.com";
+    const string AUTH_ENDPOINT = "/api/auth/login";
+    const string USER_ID       = "user";
+    const string PASSWORD      = "password";
+    // ---------------------------------------------------------------
+
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("=================================================");
+        Console.WriteLine("  SPLAN API Auth Diagnostics");
+        Console.WriteLine("=================================================\n");
+
+        await Test1_BasicConnectivity();
+        await Test2_RawPostWithFullLogging();
+        await Test3_CaseInsensitiveDeserialization();
+        await Test4_ManualJsonParse();
+        await Test5_CheckAllResponseHeaders();
+
+        Console.WriteLine("\n=================================================");
+        Console.WriteLine("  All tests complete. Press any key to exit.");
+        Console.WriteLine("=================================================");
+        Console.ReadKey();
+    }
+
+    // TEST 1 - Can we even reach the server at all?
+    static async Task Test1_BasicConnectivity()
+    {
+        PrintHeader("TEST 1 - Basic Connectivity");
+        try
+        {
+            using var client = new HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+            var response = await client.GetAsync(BASE_URL);
+            Pass($"Server reachable. Status: {(int)response.StatusCode} {response.StatusCode}");
+        }
+        catch (HttpRequestException ex) { Fail($"Cannot reach server: {ex.Message}"); }
+        catch (TaskCanceledException)   { Fail("Request timed out after 10 seconds"); }
+        catch (Exception ex)            { Fail($"Unexpected error: {ex.Message}"); }
+    }
+
+    // TEST 2 - Full POST with every detail logged before and after
+    static async Task Test2_RawPostWithFullLogging()
+    {
+        PrintHeader("TEST 2 - Raw POST With Full Logging");
+        try
+        {
+            using var client = new HttpClient();
+            var fullUrl = BASE_URL + AUTH_ENDPOINT;
+            var body    = JsonSerializer.Serialize(new { userid = USER_ID, password = PASSWORD });
+            var content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            Info($"URL:          {fullUrl}");
+            Info($"Request body: {body}");
+
+            var response = await client.PostAsync(fullUrl, content);
+            var rawBody  = await response.Content.ReadAsStringAsync();
+
+            Info($"Final URL:    {response.RequestMessage?.RequestUri}");
+            Info($"Status code:  {(int)response.StatusCode} {response.StatusCode}");
+            Info($"Raw body:     '{rawBody}'");
+
+            if (response.IsSuccessStatusCode)
+                Pass("Got a success status code");
+            else
+                Fail($"Non-success status: {(int)response.StatusCode} {response.StatusCode}");
+
+            if (!string.IsNullOrWhiteSpace(rawBody))
+                Pass("Response body is not empty");
+            else
+                Fail("Response body is empty - API returned nothing in the body");
+        }
+        catch (Exception ex) { Fail($"Exception: {ex.Message}"); }
+    }
+
+    // TEST 3 - Deserialize using case-insensitive options
+    static async Task Test3_CaseInsensitiveDeserialization()
+    {
+        PrintHeader("TEST 3 - Deserialization (Case Insensitive)");
+        try
+        {
+            using var client = new HttpClient();
+            var body     = JsonSerializer.Serialize(new { userid = USER_ID, password = PASSWORD });
+            var content  = new StringContent(body, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(BASE_URL + AUTH_ENDPOINT, content);
+            var rawBody  = await response.Content.ReadAsStringAsync();
+
+            if (string.IsNullOrWhiteSpace(rawBody)) { Fail("Cannot test - body is empty"); return; }
+
+            var options      = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var authResponse = JsonSerializer.Deserialize<AuthResponse>(rawBody, options);
+
+            if (!string.IsNullOrWhiteSpace(authResponse?.Token))
+                Pass($"Token deserialized OK: {authResponse.Token[..Math.Min(20, authResponse.Token.Length)]}...");
+            else
+                Fail("Token is null after deserialization - property name likely does not match");
+        }
+        catch (JsonException ex) { Fail($"JSON deserialization failed: {ex.Message}"); }
+        catch (Exception ex)     { Fail($"Exception: {ex.Message}"); }
+    }
+
+    // TEST 4 - Skip the model class, scan raw JSON for every property
+    //          This will catch any property name mismatch
+    static async Task Test4_ManualJsonParse()
+    {
+        PrintHeader("TEST 4 - Manual JSON Property Scan");
+        try
+        {
+            using var client = new HttpClient();
+            var body     = JsonSerializer.Serialize(new { userid = USER_ID, password = PASSWORD });
+            var content  = new StringContent(body, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(BASE_URL + AUTH_ENDPOINT, content);
+            var rawBody  = await response.Content.ReadAsStringAsync();
+
+            if (string.IsNullOrWhiteSpace(rawBody)) { Fail("Cannot test - body is empty"); return; }
+
+            using var doc = JsonDocument.Parse(rawBody);
+            Info("All top-level JSON properties the API returned:");
+            foreach (var prop in doc.RootElement.EnumerateObject())
+                Info($"  '{prop.Name}' = '{prop.Value}'");
+
+            string[] tokenNames = { "token", "Token", "access_token", "accessToken", "AccessToken", "jwt", "JWT", "bearerToken" };
+            bool found = false;
+            foreach (var name in tokenNames)
+            {
+                if (doc.RootElement.TryGetProperty(name, out var val))
+                {
+                    Pass($"Found token under property name: '{name}' = '{val}'");
+                    found = true;
+                }
+            }
+
+            if (!found)
+                Fail("No token found under any common name. Check the property list printed above.");
+        }
+        catch (JsonException ex) { Fail($"Response is not valid JSON: {ex.Message}"); }
+        catch (Exception ex)     { Fail($"Exception: {ex.Message}"); }
+    }
+
+    // TEST 5 - Dump every response and content header
+    static async Task Test5_CheckAllResponseHeaders()
+    {
+        PrintHeader("TEST 5 - Full Response Header Dump");
+        try
+        {
+            using var client = new HttpClient();
+            var body     = JsonSerializer.Serialize(new { userid = USER_ID, password = PASSWORD });
+            var content  = new StringContent(body, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(BASE_URL + AUTH_ENDPOINT, content);
+
+            Info("Response headers:");
+            foreach (var h in response.Headers)
+                Info($"  {h.Key}: {string.Join(", ", h.Value)}");
+
+            Info("Content headers:");
+            foreach (var h in response.Content.Headers)
+                Info($"  {h.Key}: {string.Join(", ", h.Value)}");
+
+            Pass("Header dump complete - review above for any token-like values");
+        }
+        catch (Exception ex) { Fail($"Exception: {ex.Message}"); }
+    }
+
+    // Model
+    class AuthResponse
+    {
+        [JsonPropertyName("token")]
+        public string Token { get; set; }
+    }
+
+    // Helpers
+    static void PrintHeader(string t) =>
+        Console.WriteLine($"\n-------------------------------------------------\n  {t}\n-------------------------------------------------");
+
+    static void Pass(string msg) => Console.WriteLine($"  [PASS] {msg}");
+    static void Fail(string msg) => Console.WriteLine($"  [FAIL] {msg}");
+    static void Info(string msg) => Console.WriteLine($"  [INFO] {msg}");
+}
+
