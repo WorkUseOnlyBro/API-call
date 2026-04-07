@@ -75,6 +75,7 @@ page_error_threshold = 0.9  # Stop pagination if this % of a page fails to inser
 sql_server = "sql ip" 
 sql_database = "DBPlaceHolder"
 sql_table = "SQLTablePlaceHolder"
+sql_last_run_table = "API_Last_Run"
 sql_username = "username"
 sql_password = "password"
 
@@ -91,7 +92,7 @@ column_mapping = {
 
 def get_last_run_time():
     """
-    Read the most recent run time from the API_Last_Run table
+    Read the most recent run time from the {sql_last_run_table} table
     Returns: datetime string in YYYY-MM-DDTHH:MM:SS format, or None if no previous run
     """
     try:
@@ -102,7 +103,7 @@ def get_last_run_time():
             database=sql_database
         )
         cursor = conn.cursor()
-        cursor.execute("SELECT MAX(last_run_time) FROM API_Last_Run")
+        cursor.execute(f"SELECT MAX(last_run_time) FROM {sql_last_run_table}")
         result = cursor.fetchone()
         cursor.close()
         conn.close()
@@ -112,7 +113,7 @@ def get_last_run_time():
             logger.info(f"Last run time from DB: {last_run}")
             return last_run
         else:
-            logger.warning("No previous run time found in API_Last_Run")
+            logger.warning(f"No previous run time found in {sql_last_run_table}")
             return None
     except Exception as e:
         logger.error(f"Error reading last run time from DB: {e}", exc_info=True)
@@ -121,10 +122,10 @@ def get_last_run_time():
 
 def save_run_time(conn, cursor):
     """
-    Write the current timestamp to the API_Last_Run table
+    Write the current timestamp to the {sql_last_run_table} table
     """
     now = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
-    cursor.execute("INSERT INTO API_Last_Run (last_run_time) VALUES (%s)", (now,))
+    cursor.execute(f"INSERT INTO {sql_last_run_table} (last_run_time) VALUES (%s)", (now,))
     conn.commit()
     logger.info(f"Saved run time to DB: {now}")
 
