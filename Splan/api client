@@ -1,0 +1,82 @@
+ public class ApiClient
+ {
+     private readonly HttpClient _httpClient;
+     private readonly ApiSettings _apiSettings;
+     private readonly FeatureFlag _featureFlag;
+     private readonly EmailService _emailService;
+     private string _accessToken;
+     public FeatureFlag FeatureFlag => _featureFlag;
+     public ApiSettings ApiSettings => _apiSettings;
+
+     public ApiClient(HttpClient httpClient, IOptions<ApiSettings> apiSettings, IOptions<FeatureFlag> featureFlag, EmailService emailService)
+     {
+         _httpClient = httpClient;
+         _apiSettings = apiSettings.Value;
+         _featureFlag = featureFlag.Value;
+         _emailService = emailService;
+     }
+
+     public async Task<List<SplanUser>> GetPagedDataAsync<T>()
+     {
+         if (string.IsNullOrEmpty(_accessToken))
+         {
+             _accessToken = await GetAuthenticationTokenAsync();
+         }
+         
+         var allData = new List<SplanUser>();
+         int pageSize = 100;
+         int index = 1;
+         bool hasMorePages = false;
+         int totalRecords = 0;
+         int currentPageCount = 0;
+         string pageRange = string.Empty;
+
+         Log.Information($"Preparing API call to SPLAN.");
+         do
+         {
+             var request = new HttpRequestMessage(HttpMethod.Post, $"{_apiSettings.BaseUrl}{_apiSettings.RolesEndpoint}?index={index}&pageSize={pageSize}");
+             request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _accessToken);
+             request.Headers.Add("content", "application/json");
+             request.Headers.Add("token", _accessToken);
+             request.Headers.Add("plocationid", _apiSettings.plocationid);
+             request.Headers.Add("memberid", _apiSettings.memberid);
+             request.Content = new StringContent(string.Empty, Encoding.UTF8, "application/json");
+             Log.Information("Access token: {AccessToken}", _accessToken); //remove later
+             Log.Information($"Requesting page {index} of data with a page size of {pageSize}.");
+             var response = await _httpClient.SendAsync(request);
+             response.EnsureSuccessStatusCode();
+
+             var pageData = await response.Content.ReadFromJsonAsync<PageResponse<SplanUser>>();
+
+             if (pageData == null)
+             {
+                 Log.Error("Failed to deserialize response.");
+                 throw new Exception("Failed to deserialize response from API.");
+             }
+             else if (pageData.Data == null)
+             {
+                 Log.Information("No data returned.");
+                 hasMorePages = false;
+                 //throw new Exception("No data returned.");
+             }
+             else
+             {
+                 allData.AddRange(pageData.Data);
+                 hasMorePages = pageData.HasMorePages;
+                 totalRecords = pageData.TotalRecords;
+                 currentPageCount = pageData.CurrentPageCount;
+                 pageRange = pageData.Page;
+                 Log.Information($"Received {pageData.Data.Count} records on page {index}. Total records: {totalRecords}. Current Page Range: {pageRange}");
+
+                 if (totalRecords > allData.Count)
+                 {
+                     hasMorePages = true;
+                     index++;
+                 }
+             }
+         } while (hasMorePages);
+
+         Log.Information("Data retrieved successfully from API.");
+         Log.Information($"Total records retrieved: {allData.Count}");
+         return allData;
+     }
