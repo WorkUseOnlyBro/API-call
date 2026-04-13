@@ -80,3 +80,20 @@
          Log.Information($"Total records retrieved: {allData.Count}");
          return allData;
      }
+----------------------
+var response = await _httpClient.SendAsync(request);
+
+if (!response.IsSuccessStatusCode)
+{
+    var errorBody = await response.Content.ReadAsStringAsync();
+    Log.Error(
+        "SPLAN request failed. Status: {StatusCode}, URL: {Url}, " +
+        "TokenPrefix: {TokenPrefix}..., TokenLength: {TokenLength}, Body: {Body}",
+        (int)response.StatusCode,
+        request.RequestUri,
+        _accessToken.Length >= 10 ? _accessToken[..10] : "(short)",
+        _accessToken.Length,
+        errorBody);
+
+    response.EnsureSuccessStatusCode();
+}
