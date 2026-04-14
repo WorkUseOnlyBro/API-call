@@ -1,0 +1,33 @@
+// Debug: log request as cURL for Postman/Insomnia import
+var curlBuilder = new StringBuilder();
+curlBuilder.AppendLine($"curl -X {request.Method.Method} '{request.RequestUri}'");
+
+foreach (var header in request.Headers)
+{
+    foreach (var value in header.Value)
+    {
+        curlBuilder.AppendLine($"  -H '{header.Key}: {value}'");
+    }
+}
+
+if (request.Content != null)
+{
+    foreach (var header in request.Content.Headers)
+    {
+        foreach (var value in header.Value)
+        {
+            curlBuilder.AppendLine($"  -H '{header.Key}: {value}'");
+        }
+    }
+
+    var body = await request.Content.ReadAsStringAsync();
+    if (!string.IsNullOrEmpty(body))
+    {
+        curlBuilder.AppendLine($"  -d '{body}'");
+    }
+    
+    // Re-set content since ReadAsStringAsync can exhaust the stream
+    request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+}
+
+Log.Information("cURL equivalent:\n{Curl}", curlBuilder.ToString());
