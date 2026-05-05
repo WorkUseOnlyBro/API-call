@@ -1,0 +1,563 @@
+"""
+Paginated API to SQL Database Script
+Fetches JSON data page by page and writes each page to SQL Server
+
+API POST Request with Tkinter Tree View for JSON Response
+TODO
+✓ Rolling stop and start dates based on current date.
+✓ Set max size, if number of data entries grabbed = max limit send error message.
+- Set password and hash to env varibles.
+✓ Fine tune pagination, don't just do one it will time out.
+- Get our own credential from Priavo.
+✓ Job and Error Logging.
+✓ Write to DB.
+⪧ Send email alert if anything fails.
+- Write documentation block.
+- Requirements text file.
+✓ Status code error handling.
+- When rows aren't added they dont get counted to the limit - fix this dummy
+- Create dockerignore file and make readme - include readme in the ignore file
+- Set non-zero exit code on failure so the scheduler/cron can detect it
+"""
+
+import os
+import requests
+import pymssql
+import json
+import logging
+from datetime import datetime, timedelta
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# === LOGGING CONFIGURATION ===
+# Set log_directory to the folder where log files should be written.
+# Set to None to default to a "logs" folder next to this script.
+log_directory = None  # e.g. r"C:\Logs\OSV_API"
+
+if log_directory is None:
+    log_directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(log_directory, exist_ok=True)
+log_file = os.path.join(log_directory, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info(f"LOG FILE: {log_file}")
+logger.info("=" * 60)
+
+# === API CONFIGURATION ===
+api_url = "URL"
+password = "password"
+arc_id = "id"
+hash_value = "hash" 
+
+# === DATE RANGE CONFIGURATION ===
+# Options: "previous_day", "since_last_run", "manual"
+date_mode = "since_last_run"
+
+# Manual dates (only used if date_mode is "manual")
+manual_start_date = "2026-01-28"  # Format: YYYY-MM-DD
+manual_end_date = "2026-01-29"    # Format: YYYY-MM-DD
+
+# === EMAIL CONFIGURATION ===
+send_email_report = False  # Set to False to disable email reports
+
+# Email settings
+smtp_server = "smtpserver.company.com"  # e.g., "smtp.gmail.com" or "smtp.office365.com"
+smtp_port = 587  # Usually 587 for TLS
+smtp_username = "user"
+smtp_password = ""  # Or app-specific password
+
+
+# Email details
+email_from = "fromemail"
+email_to = ["to email"", ""]
+email_subject = "OSV API to SQL Import Report"
+# === PAGINATION SETTINGS ===
+page_size = 100  # Number of records per page (adjust based on your API)
+start_page = 1   # Starting page number
+max_query_rows = None  # Max rows to fetch from the API total (set to None for unlimited, useful for testing)
+max_records = 10000  # Max rows to successfully insert into the DB (set to None for unlimited)
+page_error_threshold = 0.9  # Stop pagination if this % of a page fails to insert (0.9 = 90%)
+
+# === SQL SERVER CONFIGURATION ===
+sql_server = "sql ip" 
+sql_database = "DBPlaceHolder"
+sql_table = "SQLTablePlaceHolder"
+sql_last_run_table = "API_Last_Run"
+sql_username = "username"
+sql_password = "password"
+
+# === COLUMN MAPPING ===
+# Map API field names to SQL column names
+# Format: 'api_field_name': 'sql_column_name'
+column_mapping = {
+
+}
+
+# If you want to use the API field names as-is, leave this empty or set to None
+# column_mapping = None
+
+
+def get_last_run_time():
+    """
+    Read the most recent run time from the {sql_last_run_table} table
+    Returns: datetime string in YYYY-MM-DDTHH:MM:SS format, or None if no previous run
+    """
+    try:
+        conn = pymssql.connect(
+            server=sql_server,
+            user=sql_username,
+            password=sql_password,
+            database=sql_database
+        )
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT MAX(last_run_time) FROM {sql_last_run_table}")
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if result and result[0]:
+            last_run = result[0].strftime('%Y-%m-%dT%H:%M:%S')
+            logger.info(f"Last run time from DB: {last_run}")
+            return last_run
+        else:
+            logger.warning(f"No previous run time found in {sql_last_run_table}")
+            return None
+    except Exception as e:
+        logger.error(f"Error reading last run time from DB: {e}", exc_info=True)
+        return None
+
+
+def save_run_time(conn, cursor, run_time):
+    """
+    Write the run timestamp to the {sql_last_run_table} table.
+    Pass the run's start time (not now()) so the next run picks up records
+    that arrived during this run's execution window.
+    """
+    ts = run_time.strftime('%Y-%m-%dT%H:%M:%S')
+    cursor.execute(f"INSERT INTO {sql_last_run_table} (last_run_time) VALUES (%s)", (ts,))
+    conn.commit()
+    logger.info(f"Saved run time to DB: {ts}")
+
+
+def get_date_range():
+    """
+    Get the start and end dates for the API query
+    Returns: (start_date, end_date) as datetime strings
+    """
+    if date_mode == "previous_day":
+        yesterday = datetime.now() - timedelta(days=1)
+        start_date = yesterday.strftime('%Y-%m-%d')
+        end_date = yesterday.strftime('%Y-%m-%d')
+        logger.info(f"Using previous day mode - date: {start_date}")
+    elif date_mode == "since_last_run":
+        last_run = get_last_run_time()
+        if last_run:
+            start_date = last_run
+        else:
+            # Fallback to previous day if no last run exists
+            yesterday = datetime.now() - timedelta(days=1)
+            start_date = yesterday.strftime('%Y-%m-%dT%H:%M:%S')
+            logger.info("No last run found, falling back to previous day")
+        end_date = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        logger.info(f"Using since_last_run mode - start: {start_date}, end: {end_date}")
+    else:
+        start_date = manual_start_date
+        end_date = manual_end_date
+        logger.info(f"Using manual dates - start: {start_date}, end: {end_date}")
+
+    return start_date, end_date
+
+
+def send_report_email(start_time, end_time, records_pulled, errors, error_messages, limit_reached, start_date, end_date):
+    """
+    Send email report with job results
+    """
+    if not send_email_report:
+        logger.debug("Email reporting is disabled, skipping")
+        return
+
+    try:
+        # Calculate duration
+        duration = end_time - start_time
+        duration_str = str(duration).split('.')[0]  # Remove microseconds
+
+        # Build email body
+        email_body = f"""
+API to SQL Database Import Report
+{'=' * 50}
+
+Job Details:
+- Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}
+- End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}
+- Duration: {duration_str}
+- Date Range: {start_date} to {end_date}
+- Log File: {log_file}
+
+Results:
+- Records Successfully Inserted: {records_pulled}
+- Errors: {errors}
+
+"""
+
+        # Add limit warning if applicable
+        if limit_reached:
+            email_body += f"""
+WARNING: MAX RECORD LIMIT REACHED
+Only {records_pulled} records were pulled due to the configured limit.
+More data may be available from the API.
+
+"""
+
+        # Add error messages if any
+        if error_messages:
+            email_body += "Error Messages:\n"
+            for i, error in enumerate(error_messages, 1):
+                email_body += f"{i}. {error}\n"
+        else:
+            email_body += "No errors encountered.\n"
+
+        email_body += f"\n{'=' * 50}\n"
+
+        # Create email message
+        msg = MIMEMultipart()
+        # Build a status tag for the subject so it's scannable in the inbox
+        if errors > 0 or error_messages:
+            status_tag = "FAILURE" if records_pulled == 0 else "PARTIAL"
+        elif limit_reached:
+            status_tag = "LIMIT REACHED"
+        else:
+            status_tag = "SUCCESS"
+        run_date = start_time.strftime('%Y-%m-%d')
+        dynamic_subject = f"[{status_tag}] {email_subject} - {run_date} ({records_pulled} rows)"
+
+        msg['From'] = email_from
+        msg['To'] = ', '.join(email_to)
+        msg['Subject'] = dynamic_subject
+
+        msg.attach(MIMEText(email_body, 'plain'))
+
+        # Send email
+        logger.info(f"Sending email report to: {', '.join(email_to)}")
+        logger.debug(f"SMTP server: {smtp_server}:{smtp_port}")
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        #server.login(smtp_username, smtp_password)
+        server.send_message(msg)
+        server.quit()
+
+        logger.info("Email report sent successfully")
+
+    except Exception as e:
+        logger.error(f"Failed to send email report: {e}", exc_info=True)
+
+
+def fetch_page(page_number, start_date, end_date):
+    """
+    Fetch a single page of data from the API
+
+    Returns: (data_entries, has_more_pages)
+    """
+    logger.info(f"Fetching page {page_number}...")
+
+    headers = {
+        'Auth-Password': password,
+        'Arc-id': arc_id,
+        'Hash': hash_value
+    }
+
+    # Build URL with query parameters including dates and pagination
+    url_with_params = f"{api_url}?startDate={start_date}&endDate={end_date}&limit={page_size}&page={page_number}"
+    logger.debug(f"Request URL: {url_with_params}")
+    logger.debug(f"Request headers (keys): {list(headers.keys())}")
+
+    try:
+        response = requests.post(url_with_params, headers=headers)
+        logger.debug(f"Response status code: {response.status_code}")
+        logger.debug(f"Response content length: {len(response.content)} bytes")
+        response.raise_for_status()
+
+        json_data = response.json()
+        logger.debug(f"Response JSON keys: {list(json_data.keys())}")
+
+        if json_data.get('success'):
+            data_entries = json_data.get('data', [])
+            logger.info(f"Retrieved {len(data_entries)} entries from page {page_number}")
+
+            if data_entries:
+                logger.debug(f"First entry keys: {list(data_entries[0].keys())}")
+
+            # Determine if there are more pages
+            has_more = len(data_entries) == page_size
+            logger.debug(f"Has more pages: {has_more} (got {len(data_entries)}, page_size {page_size})")
+
+            return data_entries, has_more
+        else:
+            logger.warning(f"API returned success: false for page {page_number}")
+            logger.debug(f"Full API response: {json.dumps(json_data, indent=2)}")
+            return [], False
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error fetching page {page_number}: {e}")
+        logger.debug(f"Response body: {response.text[:500]}")
+        return [], False
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error fetching page {page_number}: {e}")
+        return [], False
+    except Exception as e:
+        logger.error(f"Unexpected error fetching page {page_number}: {e}", exc_info=True)
+        return [], False
+
+
+def insert_page_to_database(conn, cursor, data_entries, page_number):
+    """
+    Insert a page of data entries into SQL Server
+    """
+    if not data_entries:
+        logger.debug(f"No data entries to insert for page {page_number}")
+        return 0, 0
+
+    # Get API field names from the first entry
+    api_fields = list(data_entries[0].keys())
+    logger.debug(f"API fields: {api_fields}")
+
+    # Map to SQL column names
+    if column_mapping:
+        sql_columns = [column_mapping.get(field, field) for field in api_fields]
+        logger.debug(f"Mapped SQL columns: {sql_columns}")
+    else:
+        sql_columns = api_fields
+        logger.debug("Using API field names as SQL column names (no mapping)")
+
+    # Create INSERT statement
+    placeholders = ', '.join(['%s' for _ in sql_columns])
+    column_names = ', '.join([f"[{col}]" for col in sql_columns])
+    insert_sql = f"INSERT INTO {sql_table} ({column_names}) VALUES ({placeholders})"
+    logger.debug(f"INSERT SQL: {insert_sql}")
+
+    success_count = 0
+    error_count = 0
+
+    for i, entry in enumerate(data_entries, 1):
+        try:
+            # Extract values using the original API field names
+            values = [entry.get(field) for field in api_fields]
+            logger.debug(f"Page {page_number}, row {i}: inserting {len(values)} values")
+            cursor.execute(insert_sql, tuple(values))
+            success_count += 1
+        except Exception as e:
+            error_count += 1
+            logger.error(f"Error on row {i} of page {page_number}: {e}")
+            logger.debug(f"Failed row data: {json.dumps(entry, default=str)}")
+
+    # Commit this page
+    conn.commit()
+    logger.info(f"Page {page_number} committed: {success_count} inserted, {error_count} errors")
+
+    return success_count, error_count
+
+
+def main():
+    """
+    Main execution - fetch pages and write to database
+    """
+    # Get the date range we're querying
+    start_date, end_date = get_date_range()
+
+    # Track start time
+    start_time = datetime.now()
+
+    logger.info("=" * 60)
+    logger.info("Paginated API to SQL Database Import")
+    logger.info(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Date Range: {start_date} to {end_date}")
+    logger.info(f"Page size: {page_size}, Start page: {start_page}")
+    if max_query_rows:
+        logger.info(f"Max Query Rows (API): {max_query_rows}")
+    else:
+        logger.info("Max Query Rows (API): unlimited")
+    if max_records:
+        logger.info(f"Max Insert Records (DB): {max_records}")
+    else:
+        logger.info("Max Insert Records (DB): unlimited")
+    logger.info(f"Page Error Threshold: {page_error_threshold * 100:.0f}%")
+    logger.info(f"Target SQL Server: {sql_server}, Database: {sql_database}, Table: {sql_table}")
+    logger.info("=" * 60)
+
+    total_success = 0
+    total_errors = 0
+    total_queried = 0
+    page_number = start_page
+    limit_reached = False
+    query_limit_reached = False
+    error_messages = []
+
+    try:
+        # Connect to database once for all pages
+        logger.info(f"Connecting to SQL Server at {sql_server}...")
+        logger.debug(f"Database: {sql_database}, User: {sql_username}")
+        conn = pymssql.connect(
+            server=sql_server,
+            user=sql_username,
+            password=sql_password,
+            database=sql_database
+        )
+        cursor = conn.cursor()
+        logger.info("Connected to SQL Server successfully")
+
+        # Loop through pages
+        while True:
+            # Check if we've hit the max insert limit
+            if max_records and total_success >= max_records:
+                logger.warning(f"MAX INSERT LIMIT REACHED - stopped at {total_success} inserted (limit: {max_records})")
+                limit_reached = True
+                break
+
+            # Check if we've hit the max query limit
+            if max_query_rows and total_queried >= max_query_rows:
+                logger.warning(f"MAX QUERY LIMIT REACHED - stopped at {total_queried} rows queried (limit: {max_query_rows})")
+                query_limit_reached = True
+                break
+
+            # Fetch this page
+            try:
+                data_entries, has_more = fetch_page(page_number, start_date, end_date)
+            except Exception as e:
+                error_msg = f"Error fetching page {page_number}: {e}"
+                logger.error(error_msg, exc_info=True)
+                error_messages.append(error_msg)
+                break
+
+            # If no data, we're done
+            if not data_entries:
+                logger.info(f"No more data after page {page_number - 1}")
+                break
+
+            # Track total rows queried from the API
+            total_queried += len(data_entries)
+
+            # Trim page if it would exceed the query limit
+            if max_query_rows and total_queried > max_query_rows:
+                overage = total_queried - max_query_rows
+                data_entries = data_entries[:len(data_entries) - overage]
+                total_queried = max_query_rows
+                logger.info(f"Trimmed page {page_number} to stay within max query limit")
+
+            # Trim page if it would exceed the insert limit
+            if max_records and (total_success + len(data_entries)) > max_records:
+                records_needed = max_records - total_success
+                logger.info(f"Trimming page {page_number} to {records_needed} records to stay within max insert limit")
+                data_entries = data_entries[:records_needed]
+
+            # Write this page to database
+            logger.info(f"Writing page {page_number} to database ({len(data_entries)} entries)...")
+            try:
+                success, errors = insert_page_to_database(conn, cursor, data_entries, page_number)
+
+                total_success += success
+                total_errors += errors
+
+                logger.info(f"Page {page_number} complete: {success} inserted, {errors} errors | Running total: {total_success} inserted, {total_queried} queried")
+
+                if errors > 0:
+                    error_messages.append(f"Page {page_number} had {errors} insert errors")
+
+                # Check error threshold - if too many rows on this page failed, stop
+                if len(data_entries) > 0 and (errors / len(data_entries)) >= page_error_threshold:
+                    logger.warning(f"PAGE ERROR THRESHOLD REACHED - {errors}/{len(data_entries)} rows failed on page {page_number} ({errors / len(data_entries) * 100:.0f}% >= {page_error_threshold * 100:.0f}%)")
+                    logger.warning("Stopping pagination - likely hit existing/duplicate data")
+                    break
+
+            except Exception as e:
+                error_msg = f"Error writing page {page_number} to database: {e}"
+                logger.error(error_msg, exc_info=True)
+                error_messages.append(error_msg)
+                break
+
+            # Check if we've now hit the insert limit
+            if max_records and total_success >= max_records:
+                logger.warning(f"MAX INSERT LIMIT REACHED - stopped at {total_success} inserted (limit: {max_records})")
+                limit_reached = True
+                break
+
+            # Check if we've now hit the query limit
+            if max_query_rows and total_queried >= max_query_rows:
+                logger.warning(f"MAX QUERY LIMIT REACHED - stopped at {total_queried} rows queried (limit: {max_query_rows})")
+                query_limit_reached = True
+                break
+
+            # Check if there are more pages
+            if not has_more:
+                logger.info(f"All data retrieved (last page: {page_number})")
+                break
+
+            page_number += 1
+
+        # Save run time if we inserted any records successfully.
+        # Use start_time so the next run covers records that arrived during this run.
+        if total_success > 0:
+            save_run_time(conn, cursor, start_time)
+
+        # Close connection
+        logger.info("Closing database connection...")
+        cursor.close()
+        conn.close()
+        logger.info("Database connection closed")
+
+    except pymssql.InterfaceError as e:
+        error_msg = f"Database connection failed (interface error): {e}"
+        logger.error(error_msg, exc_info=True)
+        error_messages.append(error_msg)
+    except pymssql.DatabaseError as e:
+        error_msg = f"Database error: {e}"
+        logger.error(error_msg, exc_info=True)
+        error_messages.append(error_msg)
+    except Exception as e:
+        error_msg = f"Unexpected database error: {e}"
+        logger.error(error_msg, exc_info=True)
+        error_messages.append(error_msg)
+
+    # Track end time
+    end_time = datetime.now()
+    duration = end_time - start_time
+
+    # Summary
+    logger.info("=" * 60)
+    logger.info("FINAL RESULTS")
+    logger.info(f"Total pages processed: {page_number - start_page + 1}")
+    logger.info(f"Total rows queried from API: {total_queried}")
+    logger.info(f"Total rows inserted: {total_success}")
+    logger.info(f"Total errors: {total_errors}")
+    logger.info(f"Duration: {str(duration).split('.')[0]}")
+
+    if limit_reached:
+        logger.warning(f"ALERT: MAX INSERT LIMIT WAS REACHED - only {total_success} of available records were inserted")
+
+    if query_limit_reached:
+        logger.warning(f"ALERT: MAX QUERY LIMIT WAS REACHED - only {total_queried} rows were fetched from the API")
+
+    if error_messages:
+        logger.warning(f"Error summary ({len(error_messages)} issues):")
+        for i, msg in enumerate(error_messages, 1):
+            logger.warning(f"  {i}. {msg}")
+
+    logger.info(f"Completed: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Log file: {log_file}")
+    logger.info("=" * 60)
+
+    # Send email report
+    send_report_email(start_time, end_time, total_success, total_errors, error_messages, limit_reached, start_date, end_date)
+
+
+if __name__ == "__main__":
+    main()
