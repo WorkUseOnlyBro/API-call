@@ -1,0 +1,565 @@
+<#
+.OVERVIEW
+    Imports a folder of same-schema CSV files into a SQL Server table.
+    Uses SqlBulkCopy for speed; on a unique-index violation it rolls back and
+    retries that file row-by-row so duplicates are skipped and counted rather
+    than aborting the run. Blank/whitespace CSV cells are written as NULL.
+
+.REQUIREMENTS
+    - Windows PowerShell 5.1 / ISE (uses built-in System.Data.SqlClient and
+      Import-Csv — nothing to download or install)
+    - Uses Windows Integrated Authentication: the Windows user running this
+      PowerShell session must have INSERT permission on the target table
+    - The target table must already exist
+    - Edit the Variable Definition Block below before running
+
+.INPUTS
+    No parameters. Configure everything in the Variable Definition Block.
+
+.OUTPUTS
+    - Job log   : logs\import_<date>_job.log    (every run, milestones + summary)
+    - Error log : logs\import_<date>_error.log  (per-row and per-file failures)
+    - Exit code : 0 = clean, 1 = one or more files/rows errored
+
+.NOTES
+    Author : Alex
+    Created: 2026-06-08
+    Version: 2.0
+#>
+
+# ── Variable Definition Block ──────────────────────────────────────────────
+$SqlServer    = "placeholderSQLserver"
+$SqlDatabase  = "placeHolderSQLDB"
+$SqlSchema    = "OSVLogins"           # schema name only, no brackets (e.g. dbo)
+$SqlTable     = "user_login_sessions2" # table name only, no brackets
+
+$CsvFolder    = ".\csv-files"         # folder containing the *.csv files
+$CsvDelimiter = ","
+
+# After a CSV imports successfully it is moved here. Set an explicit path; keep it
+# OUTSIDE $CsvFolder so the next run (which recurses) does not re-import it.
+# Leave as "" to disable moving and leave files where they are.
+$CompletedFolder = "C:\path\to\completed"
+
+# Map CSV column headers -> SQL column names.
+# Leave as @{} if the CSV headers already match the SQL column names.
+$ColumnMapping = @{
+    # 'CsvHeader' = 'SqlColumnName'
+}
+
+$BatchSize   = 1000   # rows per SqlBulkCopy batch
+$BulkTimeout = 300    # SqlBulkCopy timeout in seconds
+
+# Paths (kept out of the functions per logging standard)
+$ScriptDir    = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
+$LogDir       = Join-Path $ScriptDir "logs"
+$JobLogPath   = Join-Path $LogDir "import_$(Get-Date -Format 'yyyy-MM-dd')_job.log"
+$ErrorLogPath = Join-Path $LogDir "import_$(Get-Date -Format 'yyyy-MM-dd')_error.log"
+
+# Schema-qualified, each identifier bracketed separately -> [dbo].[userlogins]
+$QualifiedTable = "[$SqlSchema].[$SqlTable]"
+
+# Integrated Security = log in as the Windows user running this PowerShell session
+$ConnString = "Server=$SqlServer;Database=$SqlDatabase;Integrated Security=True;TrustServerCertificate=True;"
+
+# Windows Forms is only needed for the interactive "map this column" prompt, and
+# only when a real desktop session is present. On headless/scheduled runs we skip
+# the GUI entirely and fall back to silently skipping the unmatched column.
+# (Note: the prompt needs an STA thread - Windows PowerShell 5.1 / ISE already
+#  run STA; if you run this under pwsh 7, launch it with -STA.)
+$script:GuiAvailable = [Environment]::UserInteractive
+if ($script:GuiAvailable) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+    } catch {
+        $script:GuiAvailable = $false
+    }
+}
+
+# Remembers what we decided for each unmapped CSV header so the same drifted
+# column doesn't pop a dialog once per file (hashtable keys are case-insensitive).
+$script:MappingDecisions = @{}
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# ── Functions ──────────────────────────────────────────────────────────────
+
+function Ensure-LogFile([string]$path) {
+    $dir = Split-Path $path -Parent
+
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType File -Path $path -Force | Out-Null
+    }
+}
+
+function Write-Log([string]$message) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $message"
+    $line | Out-File -Append -FilePath $JobLogPath
+    Write-Host $line
+}
+
+function Write-ErrorLog([string]$message) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: $message"
+    $line | Out-File -Append -FilePath $ErrorLogPath
+    Write-Host $line -ForegroundColor Red
+}
+
+# Returns the destination table's real column names as a case-insensitive set.
+# Cached in script scope so we only query the schema once per run.
+function Get-DestinationColumns {
+    param([System.Data.SqlClient.SqlConnection]$Conn)
+
+    if ($script:DestinationColumns) { return $script:DestinationColumns }
+
+    $command = $Conn.CreateCommand()
+    $command.CommandText = "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(@tbl)"
+    [void]$command.Parameters.Add("@tbl", [System.Data.SqlDbType]::NVarChar, 512)
+    $command.Parameters["@tbl"].Value = $QualifiedTable
+
+    $columns = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $reader  = $command.ExecuteReader()
+    try {
+        while ($reader.Read()) { [void]$columns.Add($reader.GetString(0)) }
+    }
+    finally {
+        $reader.Close()
+    }
+
+    if ($columns.Count -eq 0) {
+        throw "Could not read any columns for $QualifiedTable in database [$($Conn.Database)] - " +
+              "check that `$SqlDatabase points at the database that actually contains this table/schema."
+    }
+
+    $script:DestinationColumns = $columns
+    return $columns
+}
+
+# Pops a small dialog for one unmatched CSV column: shows the column name, a
+# dropdown of the table's columns to map it to, and the file's first few rows for
+# context. Returns the chosen SQL column name, or $null for "None of these map".
+function Show-ColumnMappingDialog {
+    param(
+        [string]   $CsvColumn,
+        [string[]] $SqlColumns,     # destination columns offered in the dropdown
+        [object[]] $SampleRecords,  # first few parsed CSV rows
+        [string[]] $CsvHeaders      # all CSV headers, in order, for the grid
+    )
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text            = "Unmapped CSV column"
+    $form.ClientSize      = New-Object System.Drawing.Size(624, 410)
+    $form.StartPosition   = "CenterScreen"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MaximizeBox     = $false
+    $form.MinimizeBox     = $false
+    $form.TopMost         = $true
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text     = "CSV column '$CsvColumn' was not found in the table.`r`nSelect the SQL column it should map to:"
+    $label.Location = New-Object System.Drawing.Point(12, 12)
+    $label.Size     = New-Object System.Drawing.Size(600, 36)
+    $form.Controls.Add($label)
+
+    $combo = New-Object System.Windows.Forms.ComboBox
+    $combo.DropDownStyle = "DropDownList"
+    $combo.Location      = New-Object System.Drawing.Point(12, 52)
+    $combo.Size          = New-Object System.Drawing.Size(320, 24)
+    [void]$combo.Items.AddRange($SqlColumns)
+    if ($combo.Items.Count -gt 0) { $combo.SelectedIndex = 0 }
+    $form.Controls.Add($combo)
+
+    $gridLabel = New-Object System.Windows.Forms.Label
+    $gridLabel.Text     = "First rows from this file (offending column highlighted):"
+    $gridLabel.Location = New-Object System.Drawing.Point(12, 88)
+    $gridLabel.Size     = New-Object System.Drawing.Size(600, 18)
+    $form.Controls.Add($gridLabel)
+
+    # Build a DataTable from the first few CSV rows for the preview grid.
+    $sampleTable = New-Object System.Data.DataTable
+    foreach ($header in $CsvHeaders) { [void]$sampleTable.Columns.Add($header) }
+    foreach ($record in $SampleRecords) {
+        $sampleRow = $sampleTable.NewRow()
+        foreach ($header in $CsvHeaders) {
+            $value = $record.$header
+            if ($null -eq $value) { $sampleRow[$header] = [DBNull]::Value }
+            else                  { $sampleRow[$header] = [string]$value }
+        }
+        [void]$sampleTable.Rows.Add($sampleRow)
+    }
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Location              = New-Object System.Drawing.Point(12, 110)
+    $grid.Size                  = New-Object System.Drawing.Size(600, 244)
+    $grid.ReadOnly              = $true
+    $grid.AllowUserToAddRows    = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.RowHeadersVisible     = $false
+    $grid.AutoSizeColumnsMode   = "AllCells"
+    $grid.ScrollBars            = "Both"
+    $grid.DataSource            = $sampleTable
+    # Columns are auto-generated only when the grid is first shown, so $grid.Columns
+    # is still empty here. Apply the highlight from DataBindingComplete instead.
+    $grid.Add_DataBindingComplete({
+        param($sender, $eventArgs)
+        $col = $sender.Columns[$CsvColumn]
+        if ($col) { $col.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightYellow }
+    }.GetNewClosure())
+    $form.Controls.Add($grid)
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text         = "OK"
+    $okButton.Location     = New-Object System.Drawing.Point(12, 366)
+    $okButton.Size         = New-Object System.Drawing.Size(90, 32)
+    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Controls.Add($okButton)
+    $form.AcceptButton = $okButton
+
+    $noneButton = New-Object System.Windows.Forms.Button
+    $noneButton.Text         = "None of these map"
+    $noneButton.Location     = New-Object System.Drawing.Point(110, 366)
+    $noneButton.Size         = New-Object System.Drawing.Size(150, 32)
+    $noneButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Controls.Add($noneButton)
+    $form.CancelButton = $noneButton
+
+    $result = $form.ShowDialog()
+    $chosen = if ($result -eq [System.Windows.Forms.DialogResult]::OK) { [string]$combo.SelectedItem } else { $null }
+    $form.Dispose()
+
+    return $chosen
+}
+
+# Decides what to do with one unmatched CSV header: reuses a prior decision if we
+# have one, otherwise prompts (when a GUI is available) and caches the answer.
+# Returns the SQL column to map to, or $null to skip the column.
+function Resolve-UnmatchedColumn {
+    param(
+        [string]             $CsvHeader,
+        [System.IO.FileInfo] $File,
+        $DestColumns,                  # HashSet[string] of real table columns
+        $HeaderToColumn,               # ordered dict of header -> sql column (current)
+        [object[]]           $Records  # parsed CSV rows, for the preview grid
+    )
+
+    # Decide once per distinct header per run, then reuse for every later file.
+    if ($script:MappingDecisions.ContainsKey($CsvHeader)) {
+        return $script:MappingDecisions[$CsvHeader]
+    }
+
+    # No desktop session (scheduled/headless run): skip the column, log it, move on.
+    if (-not $script:GuiAvailable) {
+        $script:MappingDecisions[$CsvHeader] = $null
+        return $null
+    }
+
+    # Offer only destination columns not already claimed by another header
+    # (SqlBulkCopy can't map two source columns onto the same destination).
+    $used = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($mapped in $HeaderToColumn.Values) { [void]$used.Add([string]$mapped) }
+    $available = @($DestColumns | Where-Object { -not $used.Contains($_) } | Sort-Object)
+
+    if ($available.Count -eq 0) {
+        $script:MappingDecisions[$CsvHeader] = $null
+        return $null
+    }
+
+    $headers = @($Records[0].PSObject.Properties.Name)
+    $sample  = @($Records | Select-Object -First 5)
+
+    $choice = Show-ColumnMappingDialog -CsvColumn $CsvHeader -SqlColumns $available `
+                  -SampleRecords $sample -CsvHeaders $headers
+
+    $script:MappingDecisions[$CsvHeader] = $choice
+    return $choice
+}
+
+# Imports one CSV file using the supplied open connection.
+# Returns [PSCustomObject] @{ Inserted; Duplicates; Errors }
+function Import-CsvFile {
+    param(
+        [System.IO.FileInfo]$File,
+        [System.Data.SqlClient.SqlConnection]$Conn
+    )
+
+    $records = @(Import-Csv -Path $File.FullName -Delimiter $CsvDelimiter -ErrorAction Stop)
+
+    if ($records.Count -eq 0) {
+        Write-Log "  (no data rows)"
+        return [PSCustomObject]@{ Inserted = 0; Duplicates = 0; Errors = 0 }
+    }
+
+    # Work out the destination column for each CSV header (via the mapping, or
+    # fall back to the header name itself when there is no explicit mapping).
+    $headerToColumn = [ordered]@{}
+    foreach ($csvHeader in $records[0].PSObject.Properties.Name) {
+        if ($ColumnMapping.ContainsKey($csvHeader)) {
+            $headerToColumn[$csvHeader] = $ColumnMapping[$csvHeader]
+        } else {
+            $headerToColumn[$csvHeader] = $csvHeader
+        }
+    }
+    # Pre-flight: CSV schemas can drift between files, so any CSV column that
+    # doesn't exist in the destination table would make SqlBulkCopy fail the whole
+    # file with its unhelpful "given ColumnMapping does not match..." error. We
+    # catch those here and, on an interactive run, prompt the user to map each one
+    # to a real column (or skip it). On headless runs the column is just skipped.
+    $destColumns = Get-DestinationColumns -Conn $Conn
+    $unmatched   = @($headerToColumn.GetEnumerator() | Where-Object { -not $destColumns.Contains($_.Value) })
+
+    foreach ($entry in $unmatched) {
+        $csvHeader = $entry.Key
+        $resolved  = Resolve-UnmatchedColumn -CsvHeader $csvHeader -File $File `
+                         -DestColumns $destColumns -HeaderToColumn $headerToColumn -Records $records
+
+        if ($resolved) {
+            $headerToColumn[$csvHeader] = $resolved
+            Write-Log "  $($File.Name) column '$csvHeader' mapped to [$resolved]"
+        } else {
+            [void]$headerToColumn.Remove($csvHeader)
+            Write-Log "  $($File.Name) did not have column(s): $csvHeader - columns skipped"
+        }
+    }
+
+    $sqlColumns = @($headerToColumn.Values)
+
+    if ($sqlColumns.Count -eq 0) {
+        Write-Log "  (no CSV columns matched the destination table - file skipped)"
+        return [PSCustomObject]@{ Inserted = 0; Duplicates = 0; Errors = 0 }
+    }
+
+    # Load the CSV into a DataTable. Blank / whitespace cells become NULL.
+    $dataTable = New-Object System.Data.DataTable
+    foreach ($columnName in $sqlColumns) {
+        [void]$dataTable.Columns.Add($columnName)
+    }
+
+    foreach ($record in $records) {
+        $row = $dataTable.NewRow()
+
+        foreach ($csvHeader in $headerToColumn.Keys) {
+            $cellValue       = $record.$csvHeader
+            $destinationCol  = $headerToColumn[$csvHeader]
+
+            if ([string]::IsNullOrWhiteSpace($cellValue)) {
+                $row[$destinationCol] = [DBNull]::Value
+            } else {
+                $row[$destinationCol] = $cellValue
+            }
+        }
+
+        [void]$dataTable.Rows.Add($row)
+    }
+
+    # ── Phase 1: SqlBulkCopy (fast path) ───────────────────────────────────
+    # Wrapped in a transaction so a unique-index violation rolls back cleanly
+    # and leaves nothing half-committed before the row-by-row retry.
+    $transaction = $Conn.BeginTransaction()
+    try {
+        $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy(
+            $Conn,
+            [System.Data.SqlClient.SqlBulkCopyOptions]::Default,
+            $transaction
+        )
+        $bulkCopy.DestinationTableName = $QualifiedTable
+        $bulkCopy.BatchSize            = $BatchSize
+        $bulkCopy.BulkCopyTimeout      = $BulkTimeout
+
+        foreach ($columnName in $sqlColumns) {
+            [void]$bulkCopy.ColumnMappings.Add($columnName, $columnName)
+        }
+
+        $bulkCopy.WriteToServer($dataTable)
+        $transaction.Commit()
+
+        return [PSCustomObject]@{ Inserted = $dataTable.Rows.Count; Duplicates = 0; Errors = 0 }
+    }
+    catch [System.Data.SqlClient.SqlException] {
+        $transaction.Rollback()
+
+        # 2601 / 2627 = unique index / unique constraint violation.
+        # Anything else is a real failure, so let it bubble up.
+        if ($_.Exception.Number -notin 2601, 2627) {
+            throw
+        }
+        Write-Log "  duplicate(s) detected - retrying row-by-row to skip them"
+    }
+    finally {
+        if ($bulkCopy) { $bulkCopy.Dispose() }
+        $transaction.Dispose()
+    }
+
+    # ── Phase 2: row-by-row (only reached after a uniqueness violation) ─────
+    # Insert one row at a time so we can skip the duplicates and count them,
+    # while still surfacing any genuinely bad rows.
+    $insertedCount   = 0
+    $duplicateCount  = 0
+    $errorCount      = 0
+
+    $columnList   = ($sqlColumns | ForEach-Object { "[$_]" }) -join ", "
+    $parameterList = (0..($sqlColumns.Count - 1) | ForEach-Object { "@p$_" }) -join ", "
+
+    $command = $Conn.CreateCommand()
+    $command.CommandText = "INSERT INTO $QualifiedTable ($columnList) VALUES ($parameterList)"
+    for ($i = 0; $i -lt $sqlColumns.Count; $i++) {
+        [void]$command.Parameters.Add("@p$i", [System.Data.SqlDbType]::NVarChar, -1)
+    }
+
+    # Progress is shown as a child bar under the file-level one (Id 0). Updating
+    # on every row would slow the loop down, so we refresh at most ~100 times.
+    $totalRows     = $dataTable.Rows.Count
+    $rowIndex      = 0
+    $progressEvery = [Math]::Max(1, [int]($totalRows / 100))
+
+    foreach ($row in $dataTable.Rows) {
+        $rowIndex++
+
+        for ($i = 0; $i -lt $sqlColumns.Count; $i++) {
+            $command.Parameters[$i].Value = $row[$i]
+        }
+
+        try {
+            [void]$command.ExecuteNonQuery()
+            $insertedCount++
+        }
+        catch [System.Data.SqlClient.SqlException] {
+            if ($_.Exception.Number -in 2601, 2627) {
+                $duplicateCount++
+            } else {
+                $errorCount++
+                Write-ErrorLog "$($File.Name) row error [$($_.Exception.Number)]: $($_.Exception.Message)"
+            }
+        }
+
+        if ($rowIndex % $progressEvery -eq 0 -or $rowIndex -eq $totalRows) {
+            Write-Progress -Id 1 -ParentId 0 `
+                -Activity "Row-by-row retry: $($File.Name)" `
+                -Status   "Row $rowIndex of $totalRows | $insertedCount inserted, $duplicateCount duplicates, $errorCount errors" `
+                -PercentComplete ([int]($rowIndex * 100 / $totalRows))
+        }
+    }
+
+    Write-Progress -Id 1 -ParentId 0 -Activity "Row-by-row retry" -Completed
+
+    return [PSCustomObject]@{
+        Inserted   = $insertedCount
+        Duplicates = $duplicateCount
+        Errors     = $errorCount
+    }
+}
+
+
+# ── Execution ──────────────────────────────────────────────────────────────
+
+Ensure-LogFile $JobLogPath
+Ensure-LogFile $ErrorLogPath
+
+$startTime = Get-Date
+Write-Log ("=" * 60)
+Write-Log "Script started"
+Write-Log "Source: $CsvFolder"
+Write-Log "Target: $SqlServer / $SqlDatabase / $QualifiedTable"
+
+# Gather the CSV files (recursing into subfolders).
+$files = @(
+    Get-ChildItem -Path $CsvFolder -Filter *.csv -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object FullName
+)
+
+if (-not $files -or $files.Count -eq 0) {
+    Write-Log "No CSV files found in $CsvFolder - nothing to do."
+    Write-Log "Script completed."
+    exit 0
+}
+
+# Running totals across all files.
+$totalBytes      = [double]($files | Measure-Object Length -Sum).Sum
+$processedBytes  = 0.0
+$totalInserted   = 0
+$totalDuplicates = 0
+$totalErrors     = 0
+$filesOk         = 0
+$filesFailed     = 0
+
+# Open one connection and reuse it for every file.
+try {
+    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnString
+    $conn.Open()
+    Write-Log "Connected to SQL Server. Files to import: $($files.Count)"
+}
+catch {
+    Write-ErrorLog "Could not connect to SQL Server: $($_.Exception.Message)"
+    exit 1
+}
+
+try {
+    for ($fileIndex = 0; $fileIndex -lt $files.Count; $fileIndex++) {
+        $file = $files[$fileIndex]
+
+        # Progress is estimated by bytes processed, not row count.
+        if ($totalBytes -gt 0) {
+            $percentComplete = [int]($processedBytes * 100 / $totalBytes)
+        } else {
+            $percentComplete = 0
+        }
+
+        Write-Progress -Activity "Importing $($fileIndex + 1) of $($files.Count): $($file.Name)" `
+                       -Status   "Inserted $totalInserted | Duplicates $totalDuplicates | Errors $totalErrors" `
+                       -PercentComplete $percentComplete
+
+        Write-Log "[$($fileIndex + 1)/$($files.Count)] $($file.Name)"
+
+        try {
+            $result = Import-CsvFile -File $file -Conn $conn
+
+            $totalInserted   += $result.Inserted
+            $totalDuplicates += $result.Duplicates
+            $totalErrors     += $result.Errors
+            $filesOk++
+
+            Write-Log "  +$($result.Inserted) inserted | $($result.Duplicates) duplicates | $($result.Errors) errors"
+
+            Move-Item $file.FullName $CompletedFolder
+        }
+        catch {
+            $filesFailed++
+            Write-ErrorLog "$($file.Name) FAILED: $($_.Exception.Message)"
+
+            # The connection may have dropped mid-run; re-establish it so the
+            # remaining files don't all fail too.
+            if ($conn.State -ne [System.Data.ConnectionState]::Open) {
+                try {
+                    $conn.Dispose()
+                    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnString
+                    $conn.Open()
+                    Write-Log "  reconnected to SQL Server"
+                }
+                catch {
+                    Write-ErrorLog "Reconnect failed: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        $processedBytes += $file.Length
+    }
+}
+finally {
+    $conn.Close()
+    $conn.Dispose()
+    Write-Progress -Activity "Importing" -Completed
+}
+
+$elapsed = ((Get-Date) - $startTime).ToString('hh\:mm\:ss')
+Write-Log "Files: $filesOk ok, $filesFailed failed | Rows: $totalInserted inserted, $totalDuplicates duplicates, $totalErrors errors"
+Write-Log "Script completed in $elapsed"
+Write-Log ("=" * 60)
+
+# Exit code so a scheduler/runner can detect failures (#15)
+if ($filesFailed -gt 0 -or $totalErrors -gt 0) {
+    Write-Log "Finished WITH ERRORS - see $ErrorLogPath"
+    exit 1
+}
+exit 0
