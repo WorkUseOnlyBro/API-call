@@ -387,12 +387,20 @@ function Import-CsvFile {
         }
         Write-Log "  duplicate(s) detected - retrying row-by-row to skip them"
     }
+    catch [System.InvalidOperationException] {
+        # SqlBulkCopy raises this client-side when a CSV value is too long for its
+        # target column ("...cannot be converted to type nvarchar..."). It can't
+        # tell us which row, so fall back to row-by-row: the good rows still import
+        # and SQL rejects only the over-long rows, which get logged individually.
+        $transaction.Rollback()
+        Write-Log "  value too long for a column - retrying row-by-row to isolate the bad row(s)"
+    }
     finally {
         if ($bulkCopy) { $bulkCopy.Dispose() }
         $transaction.Dispose()
     }
 
-    # ── Phase 2: row-by-row (only reached after a uniqueness violation) ─────
+    # ── Phase 2: row-by-row (reached after a duplicate or over-long value) ──
     # Insert one row at a time so we can skip the duplicates and count them,
     # while still surfacing any genuinely bad rows.
     $insertedCount   = 0
@@ -430,7 +438,12 @@ function Import-CsvFile {
                 $duplicateCount++
             } else {
                 $errorCount++
-                Write-ErrorLog "$($File.Name) row error [$($_.Exception.Number)]: $($_.Exception.Message)"
+                # Dump the row's values so the bad data is easy to find. DBNull
+                # cells render as empty strings.
+                $rowText = (0..($sqlColumns.Count - 1) | ForEach-Object {
+                    if ($row[$_] -is [DBNull]) { "" } else { [string]$row[$_] }
+                }) -join " | "
+                Write-ErrorLog "$($File.Name) row $rowIndex failed to insert: `"$rowText`" - $($_.Exception.Message)"
             }
         }
 
@@ -563,5 +576,3 @@ if ($filesFailed -gt 0 -or $totalErrors -gt 0) {
     exit 1
 }
 exit 0
---------------------
-2026-06-22 09:29:31 - ERROR: Login_Report_20251024_20251026.csv FAILED: Exception calling "WriteToServer" with "1" argument(s): "The given value of type String from the data source cannot be converted to type nvarchar of the specified target column."
